@@ -1,3 +1,20 @@
+"""
+Toggl → (CSV) → Google Drive に「Googleスプレッドシート」として保存するスクリプト。
+
+- 最新版：toggl_time_entries_latest（毎回上書き）
+- 日付版：toggl_time_entries_YYYY-MM-DD（任意で毎回作成）
+
+必要な環境変数（GitHub Secrets推奨）
+- TOGGL_API_TOKEN        : Toggl API token
+- TOGGL_WORKSPACE_ID     : Toggl workspace id
+- GOOGLE_DRIVE_TOKEN     : creds.to_json() の全文（OAuthで取得したトークンJSON）
+- DRIVE_FOLDER_ID        : （任意）保存先フォルダID（マイドライブ内フォルダ推奨）
+- START_DATE             : （任意）YYYY-MM-DD
+- END_DATE               : （任意）YYYY-MM-DD
+- DAYS                   : （任意）START/END未指定の場合の過去日数（例：90）
+- WRITE_DAILY_COPY        : （任意）"true"で日付版も作成（デフォルトtrue）
+"""
+
 import os
 import json
 import datetime as dt
@@ -8,6 +25,41 @@ from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaInMemoryUpload
+
+GOOGLE_SHEETS_MIME = "application/vnd.google-apps.spreadsheet"
+
+
+# ----------------------------
+# Helpers
+# ----------------------------
+def require_env(name: str) -> str:
+    v = os.environ.get(name)
+    if not v:
+        raise RuntimeError(f"Missing required env var: {name}")
+    return v
+
+
+def env_bool(name: str, default: bool) -> bool:
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def iso_date(d: dt.date) -> str:
+    return d.strftime("%Y-%m-%d")
+
+
+def resolve_date_range() -> tuple[str, str]:
+    start = os.environ.get("START_DATE")
+    end = os.environ.get("END_DATE")
+    if start and end:
+        return start, end
+
+    days = int(os.environ.get("DAYS", "90"))
+    end_d = dt.date.today()
+    start_d = end_d - dt.timedelta(days=days)
+    return iso_date(start_d), iso_date(end_d)
 
 
 # ----------------------------
@@ -20,150 +72,152 @@ def fetch_toggl_csv(
     end_date: str,
 ) -> bytes:
     """
-    Fetch time entries as CSV from Toggl Reports API v3.
+    Toggl Reports API v3: time entries CSV
+    POST /reports/api/v3/workspace/{workspace_id}/search/time_entries.csv
 
-    Endpoint:
-      POST https://api.track.toggl.com/reports/api/v3/workspace/{workspace_id}/search/time_entries.csv
-
-    Notes:
-      - This endpoint expects POST (GETだと 405 Method Not Allowed になりやすい)
-      - start_date/end_date は JSON body で渡す
+    GETだと 405 Method Not Allowed になりやすいので POST + JSON body で送ります。
     """
     url = f"https://api.track.toggl.com/reports/api/v3/workspace/{workspace_id}/search/time_entries.csv"
-
-    headers = {
-        "Accept": "text/csv",
-        "Content-Type": "application/json",
-    }
-
-    payload = {
-        "start_date": start_date,
-        "end_date": end_date,
-        # 必要になったら以下を追加できます（例）:
-        # "user_ids": [12345],
-        # "project_ids": [111, 222],
-        # "client_ids": [333],
-        # "billable": True,
-        # "description": "keyword",
-    }
+    headers = {"Accept": "text/csv", "Content-Type": "application/json"}
+    payload = {"start_date": start_date, "end_date": end_date}
 
     r = requests.post(
         url,
         headers=headers,
         json=payload,
         auth=(toggl_api_token, "api_token"),
-        timeout=60,
+        timeout=90,
     )
     r.raise_for_status()
     return r.content
 
 
 # ----------------------------
-# Google Drive (OAuth) upload
+# Google Drive (OAuth) service
 # ----------------------------
 def get_drive_service_from_token_json(token_json_str: str):
     """
-    token_json_str: creds.to_json() の出力をそのまま入れる（GOOGLE_DRIVE_TOKEN）
+    token_json_str: creds.to_json() の全文（GOOGLE_DRIVE_TOKEN）
     """
     info = json.loads(token_json_str)
     creds = Credentials.from_authorized_user_info(info)
 
-    # 期限切れなら refresh_token で更新
+    # 期限切れなら refresh_token で更新（refresh_tokenが無いと更新不可）
     if creds.expired and creds.refresh_token:
         creds.refresh(Request())
 
     return build("drive", "v3", credentials=creds)
 
 
-def upload_bytes_to_drive(
+# ----------------------------
+# Drive: Upsert CSV as Google Sheet
+# ----------------------------
+def find_file_id_by_name(drive_service, name: str, folder_id: Optional[str]) -> Optional[str]:
+    # フォルダ指定がある場合はフォルダ内だけ検索
+    safe_name = name.replace("'", "\\'")
+    q_parts = [f"name = '{safe_name}'", "trashed = false"]
+    if folder_id:
+        q_parts.append(f"'{folder_id}' in parents")
+    q = " and ".join(q_parts)
+
+    res = drive_service.files().list(
+        q=q,
+        spaces="drive",
+        fields="files(id,name,modifiedTime)",
+        pageSize=5,
+    ).execute()
+
+    files = res.get("files", [])
+    if not files:
+        return None
+    # 同名が複数あれば最初の1件（運用上は latest は1件に寄せるのが推奨）
+    return files[0]["id"]
+
+
+def upsert_csv_as_google_sheet(
     drive_service,
-    file_bytes: bytes,
-    filename: str,
-    mime_type: str = "text/csv",
+    csv_bytes: bytes,
+    sheet_name: str,
     folder_id: Optional[str] = None,
 ) -> dict:
     """
-    Upload in-memory bytes to Google Drive.
-    folder_id を指定すると、そのフォルダ配下に置く。
+    - 同名ファイルがあれば update（上書き）
+    - なければ create（CSV→Google Sheetsに変換して作成）
     """
-    file_metadata = {"name": filename}
-    if folder_id:
-        file_metadata["parents"] = [folder_id]
+    media = MediaInMemoryUpload(csv_bytes, mimetype="text/csv", resumable=False)
+    existing_id = find_file_id_by_name(drive_service, sheet_name, folder_id)
 
-    media = MediaInMemoryUpload(file_bytes, mimetype=mime_type, resumable=False)
-
-    created = (
-        drive_service.files()
-        .create(
-            body=file_metadata,
+    if existing_id:
+        # 既存SheetをCSV内容で上書き
+        updated = drive_service.files().update(
+            fileId=existing_id,
             media_body=media,
             fields="id,name,webViewLink",
-        )
-        .execute()
-    )
+        ).execute()
+        return updated
+
+    metadata = {"name": sheet_name, "mimeType": GOOGLE_SHEETS_MIME}
+    if folder_id:
+        metadata["parents"] = [folder_id]
+
+    created = drive_service.files().create(
+        body=metadata,
+        media_body=media,
+        fields="id,name,webViewLink",
+    ).execute()
     return created
 
 
 # ----------------------------
-# Helpers
+# Main
 # ----------------------------
-def iso_date(d: dt.date) -> str:
-    return d.strftime("%Y-%m-%d")
-
-
-def default_date_range(days: int = 90):
-    end = dt.date.today()
-    start = end - dt.timedelta(days=days)
-    return iso_date(start), iso_date(end)
-
-
-def require_env(name: str) -> str:
-    v = os.environ.get(name)
-    if not v:
-        raise RuntimeError(f"Missing required env var: {name}")
-    return v
-
-
 def main():
-    # --- Required ---
+    # Required
     toggl_api_token = require_env("TOGGL_API_TOKEN")
     workspace_id = require_env("TOGGL_WORKSPACE_ID")
     drive_token_json = require_env("GOOGLE_DRIVE_TOKEN")
 
-    # --- Optional ---
-    folder_id = os.environ.get("DRIVE_FOLDER_ID")  # なくても My Drive 直下に保存されます
-    start_date = os.environ.get("START_DATE")
-    end_date = os.environ.get("END_DATE")
+    # Optional
+    folder_id = os.environ.get("DRIVE_FOLDER_ID")  # My Drive 内フォルダ推奨（未指定なら直下）
+    write_daily = env_bool("WRITE_DAILY_COPY", True)
 
-    if not start_date or not end_date:
-        start_date, end_date = default_date_range(days=90)
+    start_date, end_date = resolve_date_range()
 
-    # 1) Fetch CSV from Toggl
+    print(f"[INFO] Fetching Toggl CSV: workspace={workspace_id}, range={start_date}..{end_date}")
     csv_bytes = fetch_toggl_csv(
         workspace_id=workspace_id,
         toggl_api_token=toggl_api_token,
         start_date=start_date,
         end_date=end_date,
     )
+    print(f"[INFO] CSV bytes: {len(csv_bytes)}")
 
-    # 2) Upload to Google Drive (OAuth)
+    print("[INFO] Building Drive client (OAuth)")
     drive = get_drive_service_from_token_json(drive_token_json)
 
-    timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-    filename = f"toggl_time_entries_{start_date}_to_{end_date}_{timestamp}.csv"
-
-    created = upload_bytes_to_drive(
+    # 1) latest（固定名で上書き）
+    latest_name = "toggl_time_entries_latest"
+    latest = upsert_csv_as_google_sheet(
         drive_service=drive,
-        file_bytes=csv_bytes,
-        filename=filename,
-        mime_type="text/csv",
+        csv_bytes=csv_bytes,
+        sheet_name=latest_name,
         folder_id=folder_id,
     )
+    print("✅ latest saved:", latest["name"])
+    print("   link:", latest.get("webViewLink"))
 
-    print("✅ Upload complete")
-    print(f"File: {created.get('name')}")
-    print(f"ID: {created.get('id')}")
-    print(f"Link: {created.get('webViewLink')}")
+    # 2) 日付版（任意）
+    if write_daily:
+        today = dt.date.today().strftime("%Y-%m-%d")
+        daily_name = f"toggl_time_entries_{today}"
+        daily = upsert_csv_as_google_sheet(
+            drive_service=drive,
+            csv_bytes=csv_bytes,
+            sheet_name=daily_name,
+            folder_id=folder_id,
+        )
+        print("✅ daily saved:", daily["name"])
+        print("   link:", daily.get("webViewLink"))
 
 
 if __name__ == "__main__":
